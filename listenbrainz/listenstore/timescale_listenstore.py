@@ -186,7 +186,7 @@ class TimescaleListenStore(ListenStore):
             conn.commit()
         except psycopg2.OperationalError as err:
             self.log.error("Cannot write data to timescale: %s." % str(err))
-            return 0
+            raise
 
         # So update the listen counts of the users cached in brainzutils cache.
         for ts, msid, user_name in inserted_rows:

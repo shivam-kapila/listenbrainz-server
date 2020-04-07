@@ -6,17 +6,28 @@ import os
 import pika
 import ujson
 import logging
+import psycopg2
+import sys, traceback
+import listenbrainz.utils as utils
+
 from time import time, sleep
 from listenbrainz.webserver import create_app
 from flask import current_app
-
+from listenbrainz.listenstore import TimescaleListenStore
+from listenbrainz.listenstore import RedisListenStore
 from listenbrainz.listen import Listen
 from listenbrainz.listen_writer import ListenWriter
-import psycopg2
 from psycopg2.errors import OperationalError, DuplicateTable, UntranslatableCharacter
 from psycopg2.extras import execute_values
+from listenbrainz.webserver import create_app
+from flask import current_app
+from requests.exceptions import ConnectionError
+from redis import Redis
+from collections import defaultdict
+from listenbrainz import config
 
-import sys, traceback
+from listenbrainz.listen_writer import ListenWriter
+
 
 TIMESCALE_QUEUE = "ts_incoming"
 
@@ -25,8 +36,10 @@ class TimescaleWriterSubscriber(ListenWriter):
     def __init__(self):
         super().__init__()
 
+        self.ls = None
         self.timescale = None
         self.incoming_ch = None
+        self.unique_ch = None
         self.redis_listenstore = None
 
 
@@ -47,6 +60,54 @@ class TimescaleWriterSubscriber(ListenWriter):
 
         return ret
 
+    def insert_to_listenstore(self, data, retries=5):
+        """
+        Inserts a batch of listens to the ListenStore. If this fails, then breaks the data into
+        two parts and recursively tries to insert them, until we find the culprit listen
+
+        Args:
+            data: the data to be inserted into the ListenStore
+            retries: the number of retries to make before deciding that we've failed
+
+        Returns: number of listens successfully sent
+        """
+
+        if not data:
+            return 0
+
+        failure_count = 0
+        while True:
+            try:
+                self.ls.insert(data)
+                return len(data)
+            except psycopg2.OperationalError as e:
+                failure_count += 1
+                if failure_count >= retries:
+                    break
+                sleep(self.ERROR_RETRY_DELAY)
+            except ConnectionError as e:
+                current_app.logger.error("Cannot write data to listenstore: %s. Sleep." % str(e), exc_info=True)
+                sleep(self.ERROR_RETRY_DELAY)
+
+        # if we get here, we failed on trying to write the data
+        if len(data) == 1:
+            # try to send the bad listen one more time and if it doesn't work
+            # log the error
+            try:
+                self.ls.insert(data)
+                return 1
+            except (psycopg2.OperationalError, ValueError, ConnectionError) as e:
+                error_message = 'Unable to insert bad listen to listenstore: {error}, listen={json}'
+                timescale_dict = data[0]
+                current_app.logger.error(error_message.format(error=str(e), json=json.dumps(timescale_dict, indent=3)), exc_info=True)
+                return 0
+        else:
+            slice_index = len(data) // 2
+            # send first half
+            sent = self.insert_to_listenstore(data[:slice_index], retries)
+            # send second half
+            sent += self.insert_to_listenstore(data[slice_index:], retries)
+            return sent
 
     def write(self, listens):
         '''
@@ -102,35 +163,54 @@ class TimescaleWriterSubscriber(ListenWriter):
             print("timescale-writer init")
             self._verify_hosts_in_config()
 
-            try:
-                with psycopg2.connect(current_app.config['SQLALCHEMY_TIMESCALE_URI']) as conn:
-                    print("connected to timescale")
-                    self.conn = conn
-                    while True:
-                        self.connect_to_rabbitmq()
-                        self.incoming_ch = self.connection.channel()
-                        self.incoming_ch.exchange_declare(exchange=current_app.config['INCOMING_EXCHANGE'], exchange_type='fanout')
-                        self.incoming_ch.queue_declare(current_app.config['INCOMING_QUEUE'], durable=True)
-                        self.incoming_ch.queue_bind(exchange=current_app.config['INCOMING_EXCHANGE'], queue=TIMESCALE_QUEUE)
-                        self.incoming_ch.basic_consume(
-                            lambda ch, method, properties, body: self.static_callback(ch, method, properties, body, obj=self),
-                            queue=TIMESCALE_QUEUE,
-                        )
+            while True:
+                try:
+                    self.ls = TimescaleListenStore({ 'REDIS_HOST': config.REDIS_HOST,
+                         'REDIS_PORT': config.REDIS_PORT,
+                         'REDIS_NAMESPACE': config.REDIS_NAMESPACE,
+                         'SQLALCHEMY_TIMESCALE_URI': config.SQLALCHEMY_TIMESCALE_URI
+                    }, logger=current_app.logger)
+                    break
+                except Exception as err:
+                    current_app.logger.error("Cannot connect to timescale: %s. Retrying in 2 seconds and trying again." % str(err), exc_info=True)
+                    sleep(self.ERROR_RETRY_DELAY)
 
-                        print("timescale-writer started")
-                        try:
-                            self.incoming_ch.start_consuming()
-                        except pika.exceptions.ConnectionClosed:
-                            current_app.logger.warn("Connection to rabbitmq closed. Re-opening.", exc_info=True)
-                            self.connection = None
-                            continue
+            while True:
+                try:
+                    self.redis = Redis(host=current_app.config['REDIS_HOST'], port=current_app.config['REDIS_PORT'], decode_responses=True)
+                    self.redis.ping()
+                    self.redis_listenstore = RedisListenStore(current_app.logger, current_app.config)
+                    break
+                except Exception as err:
+                    current_app.logger.error("Cannot connect to redis: %s. Retrying in 2 seconds and trying again." % str(err), exc_info=True)
+                    sleep(self.ERROR_RETRY_DELAY)
 
-                        self.connection.close()
+            while True:
+                self.connect_to_rabbitmq()
+                self.incoming_ch = self.connection.channel()
+                self.incoming_ch.exchange_declare(exchange=current_app.config['INCOMING_EXCHANGE'], exchange_type='fanout')
+                self.incoming_ch.queue_declare(current_app.config['INCOMING_QUEUE'], durable=True)
+                self.incoming_ch.queue_bind(exchange=current_app.config['INCOMING_EXCHANGE'], queue=TIMESCALE_QUEUE)
+                self.incoming_ch.basic_consume(
+                    lambda ch, method, properties, body: self.static_callback(ch, method, properties, body, obj=self),
+                    queue=TIMESCALE_QUEUE,
+                )
+
+                self.unique_ch = self.connection.channel()
+                self.unique_ch.exchange_declare(exchange=current_app.config['UNIQUE_EXCHANGE'], exchange_type='fanout')
+
+                current_app.logger.info("timescale-writer started")
+                try:
+                    self.incoming_ch.start_consuming()
+                except pika.exceptions.ConnectionClosed:
+                    current_app.logger.warn("Connection to rabbitmq closed. Re-opening.", exc_info=True)
+                    self.connection = None
+                    continue
+
+                self.connection.close()
             except Exception as err:
                 traceback.print_exc()
                 print("failed to start timescale loop ", str(err))
-
-            self.conn = None
 
 
 if __name__ == "__main__":
