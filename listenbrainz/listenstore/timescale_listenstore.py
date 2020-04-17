@@ -38,7 +38,7 @@ class TimescaleListenStore(ListenStore):
 
     REDIS_TIMESCALE_TOTAL_LISTEN_COUNT = "ls.listencount.total"
     TOTAL_LISTEN_COUNT_CACHE_TIME = 5 * 60
-    USER_LISTEN_COUNT_CACHE_TIME = 10 * 60  # in seconds. 15 minutes
+    USER_LISTEN_COUNT_CACHE_TIME = 10 * 60  # in seconds. 10 minutes
 
     def __init__(self, conf, logger):
         super(TimescaleListenStore, self).__init__(logger)
@@ -60,7 +60,7 @@ class TimescaleListenStore(ListenStore):
                 result = connection.execute(sqlalchemy.text("SELECT SUM(count) FROM listen_count WHERE user_name = :user_name"), {
                     "user_name": user_name,
                 })
-                count = result.fetchone()[0] or 0
+                count = int(result.fetchone()[0] or "0")
 
         except psycopg2.OperationalError as e:
             self.log.error("Cannot query timescale listen_count: %s" % str(e), exc_info=True)
@@ -157,6 +157,7 @@ class TimescaleListenStore(ListenStore):
         """
 
         tss = cache.get(REDIS_USER_TIMESTAMPS % user_name)
+        tss = None
         if tss:
             (min_ts, max_ts) = tss.split(",")
             min_ts = int(min_ts)
